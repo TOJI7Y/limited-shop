@@ -1,0 +1,39 @@
+local LimitedShopConfig = {}
+
+LimitedShopConfig.StockStoreName = "LIMITED_SHOP_STOCK_V1"
+
+LimitedShopConfig.Offers = {
+	HackerLuckyBlock = {
+		ProductId = 3606404498,
+		ProductType = "DeveloperProduct",
+		StartingStock = 899,
+		DisplayModelPath = "ServerStorage.LimitedShopModels.HackerLuckyBlock",
+		RewardPath = "ServerStorage.LimitedRewards.LuckyBlocks.HackerLuckyBlock",
+		RewardType = "LuckyBlock",
+		Rarity = "Secret",
+		DisplayName = "Hacker Lucky Block",
+	},
+
+	HackerStrawberryElephant = {
+		ProductId = 3606404540,
+		ProductType = "DeveloperProduct",
+		StartingStock = 899,
+		DisplayModelPath = "ServerStorage.LimitedShopModels.HackerStrawberryElephant",
+		RewardPath = "ServerStorage.LimitedRewards.Brainrots.HackerStrawberryElephant",
+		RewardType = "Brainrot",
+		Rarity = "God",
+		DisplayName = "Hacker Strawberry Elephant",
+	},
+
+	HackerBulldozer = {
+		ProductId = 3606404034,
+		ProductType = "DeveloperProduct",
+		StartingStock = 899,
+		DisplayModelPath = "ServerStorage.LimitedShopModels.HackerBulldozer",
+		RewardPath = "ServerStorage.LimitedRewards.BulldozerSkins.HackerBulldozer",
+		RewardType = "BulldozerSkin",
+		DisplayName = "Hacker Bulldozer",
+	},
+}
+
+return LimitedShopConfig
