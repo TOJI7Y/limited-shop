@@ -1,0 +1,474 @@
+-- LuckyBlockServer
+local LuckyBlockServer = {}
+
+local CollectionService = game:GetService("CollectionService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local Players           = game:GetService("Players")
+local ServerStorage     = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local BrainrotModels   = ServerStorage.ServerAssets.BrainrotModels
+local LuckyBlockPacks  = ServerStorage:FindFirstChild("LuckyBlockPacks")
+local ObjectSetup      = require(ServerStorage.ServerAssets.ServerScripts.ObjectSetup)
+local IndexSystem      = require(ServerStorage.ServerAssets.ServerScripts.IndexSystem)
+local PlacementSystem  = require(ServerStorage.ServerAssets.ServerScripts.PlacementSever)
+local UpgradeConfig    = require(ServerStorage.ServerAssets.ServerScripts.UpgradeConfig)
+local WeatherSystem    = require(ServerStorage.ServerAssets.ServerScripts.WeatherSystem)
+local WeatherConfig    = require(ReplicatedStorage:WaitForChild("ReplicatedStorageAssets"):WaitForChild("ModuleScripts"):WaitForChild("WeatherConfig"))
+local ServerRebirthHandler = require(game:GetService("ServerScriptService").Server.UiRelated.ServerRebirthHandler)
+
+local EventsFolder     = ReplicatedStorage:WaitForChild("ReplicatedStorageAssets"):WaitForChild("Events")
+local LuckyBlockOpen   = EventsFolder:WaitForChild("LuckyBlockOpen")
+local LuckyBlockReveal = EventsFolder:WaitForChild("LuckyBlockReveal")
+
+local RARITY_TIMES = {
+	Common    = 10,
+	Uncommon  = 30,
+	Rare      = 90,
+	Legendary = 270,
+	Mythic    = 810,
+	Secret    = 2430,
+}
+
+local DISPLAY_COUNT      = 10
+local ANIMATION_DURATION = 3  -- matches client animation length (~3s), winner placed right after
+local SKIP_TIME_PRODUCT_ID = 0 -- Replace with the Skip Lucky Block Timer developer product ID
+
+local SPECIAL_LUCKY_BLOCKS = {
+	HackerLuckyBlock = {
+		PackName = "HackerLuckyBlock",
+		Time = RARITY_TIMES.Secret,
+		ObjectText = "Hacker Lucky Block",
+	},
+}
+
+local activeCountdowns  = {}
+local activeLuckyBlocks = {}  -- all live lucky block objects on stands
+local pendingSkipRequests = {} -- [userId] = lucky block object waiting for receipt confirmation
+
+local function applyWeatherToLuckyBlock(object)
+	if not object or not object.Parent then return end
+	local weather = WeatherSystem.GetActiveWeather()
+	object:SetAttribute("Weather", weather or "None")
+end
+
+local function getBlockRarity(name)
+	return name:match("^(.-)LuckyBlock$")
+end
+
+local function getMainPart(object)
+	if object:IsA("BasePart") then return object end
+	if object.PrimaryPart then return object.PrimaryPart end
+	for _, child in ipairs(object:GetChildren()) do
+		if child:IsA("BasePart") then return child end
+	end
+	return nil
+end
+
+local function getRandomBrainrot()
+	local all = {}
+	for _, rarityFolder in ipairs(BrainrotModels:GetChildren()) do
+		for _, model in ipairs(rarityFolder:GetChildren()) do
+			if not model.Name:find("LuckyBlock$") and model:GetAttribute("Limited") ~= true then
+				table.insert(all, model)
+			end
+		end
+	end
+	if #all == 0 then return nil end
+	return all[math.random(1, #all)]
+end
+
+local function getSpecialBlockPack(blockName)
+	local config = SPECIAL_LUCKY_BLOCKS[blockName]
+	if not config then return nil, nil end
+
+	local packFolder = LuckyBlockPacks and LuckyBlockPacks:FindFirstChild(config.PackName)
+	if not packFolder then
+		warn("[LuckyBlockServer] Missing lucky block pack:", config.PackName)
+		return config, nil
+	end
+
+	return config, packFolder
+end
+
+local function collectPackedRewards(packFolder)
+	local list = {}
+	if not packFolder then return list end
+
+	for _, child in ipairs(packFolder:GetChildren()) do
+		if child:IsA("Folder") then
+			for _, model in ipairs(child:GetChildren()) do
+				if model:IsA("Model") and not model.Name:find("LuckyBlock$") then
+					table.insert(list, {
+						template = model,
+						rarity = model:GetAttribute("Rarity") or child.Name,
+					})
+				end
+			end
+		elseif child:IsA("Model") and not child.Name:find("LuckyBlock$") then
+			table.insert(list, {
+				template = child,
+				rarity = child:GetAttribute("Rarity") or "Secret",
+			})
+		end
+	end
+
+	return list
+end
+
+local function getRandomPackedReward(packFolder)
+	local rewards = collectPackedRewards(packFolder)
+	if #rewards == 0 then return nil, nil end
+
+	local reward = rewards[math.random(1, #rewards)]
+	return reward.template, reward.rarity
+end
+
+local function getRandomDisplayTemplate(packFolder)
+	if packFolder then
+		local template = getRandomPackedReward(packFolder)
+		if template then return template end
+	end
+
+	return getRandomBrainrot()
+end
+
+local function rollWinner(blockRarity, packFolder)
+	if packFolder then
+		local template, rarity = getRandomPackedReward(packFolder)
+		if not template then return nil, nil, nil end
+		return template.Name, template:GetAttribute("Rarity") or rarity, template
+	end
+
+	local folder = BrainrotModels:FindFirstChild(blockRarity)
+	if not folder then return nil, nil, nil end
+	local list = {}
+	for _, model in ipairs(folder:GetChildren()) do
+		if not model.Name:find("LuckyBlock$") and model:GetAttribute("Limited") ~= true then
+			table.insert(list, model.Name)
+		end
+	end
+	if #list == 0 then return nil, nil, nil end
+	return list[math.random(1, #list)], blockRarity, nil
+end
+
+local function positionOnStand(clone, stand)
+	if clone:IsA("BasePart") then
+		clone.Anchored   = true
+		clone.CanCollide = false
+		clone.CanQuery   = false
+	end
+	for _, d in ipairs(clone:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored   = true
+			d.CanCollide = false
+			d.CanQuery   = false
+		end
+	end
+	local root = clone.PrimaryPart
+		or (clone:IsA("BasePart") and clone)
+		or clone:FindFirstChildOfClass("BasePart")
+	if not root then return end
+	local halfObjectHeight = root.Size.Y / 2
+	local halfStandHeight  = stand.Size.Y / 2
+	local targetPos = stand.Position + Vector3.new(0, halfStandHeight + halfObjectHeight, 0)
+	root.CFrame = CFrame.new(targetPos, targetPos + stand.CFrame.LookVector)
+end
+
+local function getPadOwner(pad)
+	local plot = pad:FindFirstAncestorWhichIsA("Model")
+	while plot and plot:GetAttribute("Owner") == nil do
+		plot = plot.Parent
+	end
+
+	return plot and plot:GetAttribute("Owner") or nil
+end
+
+local function canPlayerUsePad(player, pad)
+	return player and getPadOwner(pad) == player.Name
+end
+
+local function requestSkipPurchase(player, object, pad)
+	if not canPlayerUsePad(player, pad) then return end
+	if not object or not object.Parent then return end
+	if (object:GetAttribute("LuckyBlockTime") or 0) <= 0 then return end
+
+	if SKIP_TIME_PRODUCT_ID <= 0 then
+		warn("[LuckyBlockServer] Skip time developer product ID is not configured.")
+		return
+	end
+
+	pendingSkipRequests[player.UserId] = object
+	MarketplaceService:PromptProductPurchase(player, SKIP_TIME_PRODUCT_ID)
+end
+
+local function completeSkipPurchase(player)
+	local object = pendingSkipRequests[player.UserId]
+	pendingSkipRequests[player.UserId] = nil
+
+	if not object or not object.Parent then
+		return false
+	end
+
+	if (object:GetAttribute("LuckyBlockTime") or 0) <= 0 then
+		return true
+	end
+
+	object:SetAttribute("LuckyBlockTime", 0)
+	return true
+end
+
+local function processReceipt(receiptInfo)
+	if SKIP_TIME_PRODUCT_ID <= 0 or receiptInfo.ProductId ~= SKIP_TIME_PRODUCT_ID then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	local player = Players:GetPlayerByUserId(receiptInfo.PlayerId)
+	if not player then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	completeSkipPurchase(player)
+	return Enum.ProductPurchaseDecision.PurchaseGranted
+end
+
+local function finalisePadWithWinner(pad, stand, winnerName, winnerRarity, lbWeather, winnerTemplate)
+	-- Clone and place the winner fresh
+	local template = winnerTemplate
+	if not template then
+		local rarityFolder = BrainrotModels:FindFirstChild(winnerRarity)
+		template = rarityFolder and rarityFolder:FindFirstChild(winnerName)
+	end
+	if not template then return end
+
+	local clone = template:Clone()
+	positionOnStand(clone, stand)
+	clone.Parent = stand
+
+	-- Carry over lucky block's weather to the winner
+	local weatherName = (lbWeather and lbWeather ~= "None") and lbWeather or nil
+	local weatherMult = weatherName and (WeatherConfig.GetMultiplier(weatherName) or 1) or 1
+	local mutation = clone:GetAttribute("Mutation") or "None"
+	ObjectSetup.SetupObject(clone, winnerRarity, mutation, weatherName or "None", weatherMult)
+	CollectionService:AddTag(clone, "Object")
+	CollectionService:AddTag(clone, "Animate")
+
+	local production = clone:GetAttribute("Production") or 0
+	local level = 1
+
+	pad:SetAttribute("Empty", false)
+	pad:SetAttribute("TotalMoney", 0)
+	pad:SetAttribute("ObjectLevel", level)
+	pad:SetAttribute("ObjectProduction", production)
+	pad:SetAttribute("ObjectName", winnerName)
+	pad:SetAttribute("ObjectRarity", winnerRarity)
+	pad:SetAttribute("ObjectMutation", mutation)
+
+	local baseProduction = UpgradeConfig.DeriveBaseProduction(production, level)
+	local upgradeCost    = UpgradeConfig.CalculateUpgradeCost(level, baseProduction)
+	pad:SetAttribute("UpgradeCost", upgradeCost)
+
+	PlacementSystem.RestartProduction(pad, production)
+end
+
+local function startPadCountdown(object, pad)
+	if activeCountdowns[object] then
+		activeCountdowns[object]()
+		activeCountdowns[object] = nil
+	end
+
+	local blockRarity = getBlockRarity(object.Name)
+	if not blockRarity then return end
+
+	local specialConfig, specialPack = getSpecialBlockPack(object.Name)
+
+	local stand = pad:FindFirstChild("Stand")
+	if not stand then return end
+
+	-- Use saved time if rejoining, otherwise use rarity default
+	local existingTime = object:GetAttribute("LuckyBlockTime")
+	local defaultTime = specialConfig and specialConfig.Time or (RARITY_TIMES[blockRarity] or 10)
+	local lbTime = (existingTime and existingTime > 0) and existingTime or defaultTime
+	object:SetAttribute("LuckyBlockTime", lbTime)
+
+	local mainPart = getMainPart(object)
+	if not mainPart then return end
+
+	local oldPP = mainPart:FindFirstChildOfClass("ProximityPrompt")
+	if oldPP then oldPP:Destroy() end
+
+	local pp = Instance.new("ProximityPrompt")
+	pp.ActionText            = "Skip Time"
+	pp.ObjectText            = (specialConfig and specialConfig.ObjectText) or "Lucky Block"
+	pp.MaxActivationDistance = 10
+	pp.Style                 = Enum.ProximityPromptStyle.Custom
+	pp.KeyboardKeyCode       = Enum.KeyCode.F
+	pp.GamepadKeyCode        = Enum.KeyCode.ButtonY
+	pp.HoldDuration          = 0
+	pp.Enabled               = true
+	pp.Parent                = mainPart
+
+	-- Register this lucky block and immediately apply current weather
+	activeLuckyBlocks[object] = true
+	applyWeatherToLuckyBlock(object)
+
+	local cancelled = false
+	activeCountdowns[object] = function()
+		cancelled = true
+		if pp and pp.Parent then pp:Destroy() end
+		object:SetAttribute("LuckyBlockTime", nil)
+		activeLuckyBlocks[object] = nil
+	end
+
+	local conn
+	conn = object.AncestryChanged:Connect(function()
+		if not object:IsDescendantOf(workspace) then
+			activeLuckyBlocks[object] = nil
+			if activeCountdowns[object] then
+				activeCountdowns[object]()
+				activeCountdowns[object] = nil
+			end
+			if conn then conn:Disconnect() end
+		end
+	end)
+
+	local opened = false
+	local function openLuckyBlock(player)
+		if opened or not object.Parent then return end
+		opened = true
+		pp.Enabled = false
+
+		-- Capture weather before destroying (used for winner)
+		local lbWeather = object:GetAttribute("Weather") or "None"
+		activeLuckyBlocks[object] = nil
+
+		-- Destroy block immediately before anything else
+		object:Destroy()
+		task.wait()
+
+		local winnerName, winnerRarity, winnerTemplate = rollWinner(blockRarity, specialPack)
+		if not winnerName then return end
+
+		-- Clone only display (non-winner) models on the stand
+		local displayModels = {}
+		for _ = 1, DISPLAY_COUNT do
+			local template = getRandomDisplayTemplate(specialPack)
+			if template then
+				local clone = template:Clone()
+				CollectionService:RemoveTag(clone, "Object")
+				CollectionService:RemoveTag(clone, "Animate")
+				positionOnStand(clone, stand)
+				clone.Parent = stand
+				table.insert(displayModels, clone)
+			end
+		end
+
+		-- Fire animation to ALL clients with only display models (no winner)
+		LuckyBlockOpen:FireAllClients(displayModels)
+
+		-- After animation: destroy display models, place winner, fire reveal
+		task.delay(ANIMATION_DURATION, function()
+			-- Clean up display models
+			for _, m in ipairs(displayModels) do
+				if m and m.Parent then m:Destroy() end
+			end
+
+			-- Place winner, carrying over the lucky block's weather
+			finalisePadWithWinner(pad, stand, winnerName, winnerRarity, lbWeather, winnerTemplate)
+
+			-- Signal all clients: winner is now on the stand
+			LuckyBlockReveal:FireAllClients(stand)
+
+			-- Unlock in index
+			if player and player.Parent then
+				IndexSystem.UnlockNPC(player, winnerName)
+				ServerRebirthHandler.MarkLuckyBlockOwned(player, blockRarity .. "LuckyBlock")
+			end
+		end)
+	end
+
+	pp.Triggered:Connect(function(player)
+		if opened or not object.Parent then return end
+		if not canPlayerUsePad(player, pad) then return end
+
+		if (object:GetAttribute("LuckyBlockTime") or 0) > 0 then
+			requestSkipPurchase(player, object, pad)
+			return
+		end
+
+		openLuckyBlock(player)
+	end)
+
+	task.spawn(function()
+		local timeLeft = lbTime
+		while timeLeft > 0 and not cancelled and object.Parent do
+			task.wait(1)
+			if cancelled or not object.Parent then return end
+
+			local currentTime = object:GetAttribute("LuckyBlockTime")
+			if currentTime and currentTime <= 0 then
+				timeLeft = 0
+				break
+			end
+
+			timeLeft = math.max(0, (currentTime or timeLeft) - 1)
+			object:SetAttribute("LuckyBlockTime", timeLeft)
+		end
+		if cancelled or not object.Parent then return end
+
+		pp.ActionText = "Open"
+		pp.Enabled = true
+	end)
+end
+
+local function watchPad(pad)
+	local stand = pad:FindFirstChild("Stand")
+	if not stand then return end
+
+	for _, child in ipairs(stand:GetChildren()) do
+		if child.Name:find("LuckyBlock$") then
+			startPadCountdown(child, pad)
+		end
+	end
+
+	stand.ChildAdded:Connect(function(child)
+		if child.Name:find("LuckyBlock$") then
+			task.wait()
+			startPadCountdown(child, pad)
+		end
+	end)
+end
+
+function LuckyBlockServer.Start()
+	if SKIP_TIME_PRODUCT_ID > 0 then
+		local previousProcessReceipt = MarketplaceService.ProcessReceipt
+		MarketplaceService.ProcessReceipt = function(receiptInfo)
+			local decision = processReceipt(receiptInfo)
+			if decision ~= Enum.ProductPurchaseDecision.NotProcessedYet then
+				return decision
+			end
+
+			if previousProcessReceipt then
+				return previousProcessReceipt(receiptInfo)
+			end
+
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+	end
+
+	for _, pad in ipairs(CollectionService:GetTagged("Pad")) do
+		watchPad(pad)
+	end
+	CollectionService:GetInstanceAddedSignal("Pad"):Connect(watchPad)
+
+	-- Whenever weather activates or deactivates, update all live lucky blocks
+	workspace:GetAttributeChangedSignal("ActiveWeather"):Connect(function()
+		for object in pairs(activeLuckyBlocks) do
+			if object and object.Parent then
+				applyWeatherToLuckyBlock(object)
+			end
+		end
+	end)
+end
+
+return LuckyBlockServer
