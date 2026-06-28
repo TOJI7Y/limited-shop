@@ -1,0 +1,206 @@
+-- LuckyBlockClient
+local LuckyBlockClient = {}
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local ClientModules  = ReplicatedStorage:WaitForChild("ReplicatedStorageAssets"):WaitForChild("ModuleScripts")
+local ParticleUtil   = require(ClientModules:WaitForChild("ParticleUtil"))
+local SoundUtil      = require(ClientModules:WaitForChild("SoundUtil"))
+
+local SWITCH_SOUND = "139744680677569"
+local WINNER_SOUND = "9045122943"
+
+local EventsFolder     = ReplicatedStorage:WaitForChild("ReplicatedStorageAssets"):WaitForChild("Events")
+local LuckyBlockOpen   = EventsFolder:WaitForChild("LuckyBlockOpen")
+local LuckyBlockReveal = EventsFolder:WaitForChild("LuckyBlockReveal")
+
+-- Animation config
+local STEPS         = 20
+local INTERVAL_FAST = 0.04
+local INTERVAL_SLOW = 0.35
+
+-- Rise-from-below tween
+local RISE_OFFSET   = Vector3.new(0, -3, 0)
+
+-- Track active tweens per model so we can cancel them
+local activeTweens = {}
+
+local function cancelTweens(model)
+	if activeTweens[model] then
+		for _, t in ipairs(activeTweens[model]) do
+			t:Cancel()
+		end
+		activeTweens[model] = nil
+	end
+end
+
+local function collectPartData(model)
+	local data = {}
+	if model:IsA("BasePart") then
+		table.insert(data, { part = model, origCF = model.CFrame })
+	else
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") then
+				table.insert(data, { part = d, origCF = d.CFrame })
+			end
+		end
+	end
+	return data
+end
+
+local function hideModel(model)
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") or d:IsA("MeshPart") then
+			d.LocalTransparencyModifier = 1
+		end
+	end
+	if model:IsA("BasePart") then
+		model.LocalTransparencyModifier = 1
+	end
+end
+
+local function showModel(model)
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") or d:IsA("MeshPart") then
+			d.LocalTransparencyModifier = 0
+		end
+	end
+	if model:IsA("BasePart") then
+		model.LocalTransparencyModifier = 0
+	end
+end
+
+local function tweenModelIn(model, partData, duration)
+	cancelTweens(model)
+	-- Offset all parts downward first
+	for _, d in ipairs(partData) do
+		if d.part.Parent then
+			d.part.CFrame = d.origCF + RISE_OFFSET
+		end
+	end
+	-- Make visible
+	showModel(model)
+	-- Tween each part back to its original position
+	local info = TweenInfo.new(duration or 0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	local tweens = {}
+	for _, d in ipairs(partData) do
+		if d.part.Parent then
+			local t = TweenService:Create(d.part, info, { CFrame = d.origCF })
+			t:Play()
+			table.insert(tweens, t)
+		end
+	end
+	activeTweens[model] = tweens
+end
+
+local function addBlackHighlight(model)
+	local h = Instance.new("Highlight")
+	h.FillColor           = Color3.new(0, 0, 0)
+	h.FillTransparency    = 0
+	h.OutlineColor        = Color3.new(0, 0, 0)
+	h.OutlineTransparency = 0
+	h.Parent              = model
+end
+
+local function clearHighlights(model)
+	for _, h in ipairs(model:GetChildren()) do
+		if h:IsA("Highlight") then h:Destroy() end
+	end
+end
+
+local function hideBillboards(model)
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BillboardGui") then d.Enabled = false end
+	end
+end
+
+local function runAnimation(displayModels)
+	if not displayModels or #displayModels == 0 then return end
+
+	-- Collect original CFrames and hide all models upfront
+	local allPartData = {}
+	for i, m in ipairs(displayModels) do
+		if m and m.Parent then
+			allPartData[i] = collectPartData(m)
+			hideModel(m)
+			hideBillboards(m)
+		end
+	end
+
+	local count   = #displayModels
+	local prevIdx = nil
+
+	for step = 1, STEPS do
+		local t        = (step - 1) / math.max(STEPS - 1, 1)
+		local interval = INTERVAL_FAST + (INTERVAL_SLOW - INTERVAL_FAST) * (t ^ 2)
+
+		-- Hide previous
+		if prevIdx then
+			local prev = displayModels[prevIdx]
+			if prev and prev.Parent then
+				cancelTweens(prev)
+				hideModel(prev)
+				clearHighlights(prev)
+			end
+		end
+
+		-- Pick next (avoid repeating same model twice in a row)
+		local nextIdx
+		repeat
+			nextIdx = math.random(1, count)
+		until nextIdx ~= prevIdx or count == 1
+
+		-- Add highlight BEFORE showing so there's no unhighlighted flash
+		local curr = displayModels[nextIdx]
+		if curr and curr.Parent and allPartData[nextIdx] then
+			addBlackHighlight(curr)
+			hideBillboards(curr)
+			tweenModelIn(curr, allPartData[nextIdx], interval * 0.8)
+			-- Play switch sound on the model's root part
+			local switchPart = (curr:IsA("Model") and (curr.PrimaryPart or curr:FindFirstChildOfClass("BasePart")))
+				or (curr:IsA("BasePart") and curr)
+			if switchPart then
+				SoundUtil:SoundPlay(switchPart, SWITCH_SOUND)
+			end
+		end
+
+		prevIdx = nextIdx
+		task.wait(interval)
+	end
+
+	-- Hide the last shown model when animation ends
+	if prevIdx then
+		local last = displayModels[prevIdx]
+		if last and last.Parent then
+			cancelTweens(last)
+			hideModel(last)
+			clearHighlights(last)
+		end
+	end
+end
+
+function LuckyBlockClient.Start()
+	-- Run slot-machine animation (display models are all non-winners)
+	LuckyBlockOpen.OnClientEvent:Connect(function(displayModels)
+		task.spawn(runAnimation, displayModels)
+	end)
+
+	-- Winner has been placed on the stand — play Sparkles + winner sound on it
+	LuckyBlockReveal.OnClientEvent:Connect(function(stand)
+		if not stand or not stand.Parent then return end
+		for _, child in ipairs(stand:GetChildren()) do
+			if (child:IsA("Model") or child:IsA("BasePart")) and not child.Name:find("LuckyBlock$") then
+				local part = (child:IsA("Model") and (child.PrimaryPart or child:FindFirstChildOfClass("BasePart")))
+					or (child:IsA("BasePart") and child)
+				if part then
+					ParticleUtil:EmitOnPart(part, "Sparkles", 20)
+					SoundUtil:SoundPlay(part, WINNER_SOUND)
+				end
+				break
+			end
+		end
+	end)
+end
+
+return LuckyBlockClient
